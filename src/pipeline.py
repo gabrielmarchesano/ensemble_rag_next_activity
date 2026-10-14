@@ -31,7 +31,9 @@ class RAGPipeline:
             'deepseek': ['deepseek-ai/DeepSeek-R1-Distill-Qwen-7B', 'deepseek-ai/DeepSeek-R1-Distill-Llama-8B'],
             'angeloc1': ['angeloc1/autotrain-phi-ft-nap']
         }
-    }
+    } #Talvez seja preciso trocar os modelos utilizados caso eu não tenha acesso a algum deles.
+      #Modelos locais são carregados via HuggingFace, enquanto modelos de API são carregados via LangChain. 
+      #Talvez seja necessário rodar os modelos locais via Google Colab
     TERMINATOR_TOKENS = {
         'metaai': "<|eot_id|>",
         'mistral': "[/INST]]",
