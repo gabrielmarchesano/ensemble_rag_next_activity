@@ -33,7 +33,9 @@ def evaluate_pipeline(pipeline_instance: p.RAGPipeline, vect_db, num_chunks: int
         expected_prediction = el[1]
         oracle.add_prefix_with_expected_answer_pair(prefix, expected_prediction)
         prompt, answer = pipeline_instance.produce_answer(prefix, vect_db, num_chunks, info_run)
-        oracle.verify_answer(prompt, prefix, answer)
+        # [FIX 7] Passa o rótulo da própria linha (o dict por prefixo trocava rótulos de prefixos repetidos)
+        #         Antes: oracle.verify_answer(prompt, prefix, answer)
+        oracle.verify_answer(prompt, prefix, answer, expected_answer=expected_prediction)
         count += 1
         print(f'Processing prediction for prefix {count} of {len(list_questions)}...')
 
@@ -93,8 +95,19 @@ def parse_arguments():
                         default='sepsis.xes')
     parser.add_argument('--prefix_base', type=int, help='Base number of events in a prefix trace',
                         default=1)
+    # [FIX 8] O default declarado era 1, mas o build_prefixes era chamado sem argumentos e rodava com 3.
+    #         Agora o argumento é usado de verdade; default 3 = o que o código efetivamente rodava.
+    #         Antes: parser.add_argument('--prefix_gap', ..., default=1)
     parser.add_argument('--prefix_gap', type=int, help='Gap number of events in a prefix trace',
-                        default=1)
+                        default=3)
+    # [FIX 4] Argumentos novos (antes 0.3 e 300 eram fixos no código: generate_test_set(traces, 0.3) e size=300).
+    # [FIX 2] --include_label_attributes True volta ao comportamento antigo dos atributos.
+    parser.add_argument('--test_proportion', type=float, default=0.3,
+                        help='Proportion of TRACES held out for testing (paper §5.2: 70/30)')
+    parser.add_argument('--test_size', type=int, default=300,
+                        help='Number of test prefixes sampled from the held-out traces')
+    parser.add_argument('--include_label_attributes', type=u.str2bool, default=False,
+                        help='Old behaviour: include the attributes of the label event in Values (leaks the label)')
     parser.add_argument('--max_new_tokens', type=int, help='Maximum number of tokens to generate',
                         default=2048)
     parser.add_argument('--batch_size', type=int, default=32)
@@ -125,21 +138,44 @@ def main():
     num_docs = args.num_documents_in_context
     test_set_path = os.path.join(os.path.dirname(__file__), '..', 'tests', 'test_sets',
                                  f"test_set_{args.log.split('.xes')[0]}_{args.evaluation_modality}.csv")
-    event_attributes = []
-    activities_set = set()
-    total_traces_size = 0
     test_set_size = 0
     traces_to_store_size = 0
+
+    # [FIX 4] Split por trace ANTES de indexar: a KB só recebe traces de treino.
+    # [FIX 9] O log é sempre lido (é barato), para 'Activities'/'Event Attributes' existirem mesmo com
+    #         --rebuild_db_and_tests False (antes o oracle quebrava com KeyError nesse caso).
+    # Antes:
+    #     event_attributes = []
+    #     activities_set = set()
+    #     total_traces_size = 0
+    #     test_set_size = 0
+    #     traces_to_store_size = 0
+    #     if args.rebuild_db_and_tests:
+    #         content = lp.read_event_log(args.log)
+    #         traces = lp.extract_traces(content)
+    #         prefixes = lp.build_prefixes(traces)                       # 100% das traces, gap fixo em 3
+    #         prefixes, event_attributes, activities_set = lp.process_prefixes(prefixes, args.log)
+    #         traces_to_store_size = len(prefixes)
+    #         vs.store_traces(prefixes, q_client, args.log, embed_model, COLLECTION_NAME)   # indexa tudo
+    #         test_set = lp.generate_test_set(traces, 0.3)               # teste sorteado das MESMAS traces
+    #         test_set_size = len(test_set)
+    #         lp.generate_csv_from_test_set(test_set, test_set_path, log_name=args.log)
+    content = lp.read_event_log(args.log)
+    traces = lp.extract_traces(content)
+    total_traces_size = len(traces)
+    kb_traces, test_traces = lp.split_traces(traces, args.test_proportion)
+    kb_prefixes = lp.build_prefixes(kb_traces, args.prefix_base, args.prefix_gap)
+    kb_docs, event_attributes, activities_set = lp.process_prefixes(kb_prefixes, args.log,
+                                                                    args.include_label_attributes)
     if args.rebuild_db_and_tests:
-        content = lp.read_event_log(args.log)
-        traces = lp.extract_traces(content)
-        prefixes = lp.build_prefixes(traces)
-        prefixes, event_attributes, activities_set = lp.process_prefixes(prefixes, args.log)
-        traces_to_store_size = len(prefixes)
-        vs.store_traces(prefixes, q_client, args.log, embed_model, COLLECTION_NAME)
-        test_set = lp.generate_test_set(traces, 0.3)
-        test_set_size = len(test_set)
-        lp.generate_csv_from_test_set(test_set, test_set_path, log_name=args.log)
+        traces_to_store_size = vs.store_traces(kb_docs, q_client, args.log, embed_model, COLLECTION_NAME)
+        test_attrs, test_acts = lp.generate_csv_from_test_set(test_traces, test_set_path, size=args.test_size,
+                                                              log_name=args.log, base=args.prefix_base,
+                                                              gap=args.prefix_gap,
+                                                              include_label_attributes=args.include_label_attributes)
+        event_attributes = {**test_attrs, **event_attributes}
+        activities_set = activities_set | test_acts   # espaço de classes = todas as atividades do log
+    test_set_size = len(test_traces)
 
     model_id = args.llm_id
     max_new_tokens = args.max_new_tokens
@@ -154,7 +190,9 @@ def main():
         'Event Log': args.log,
         'Total Traces in Log': total_traces_size,
         'Test Set Size': test_set_size,
+        'KB Traces': len(kb_traces),                                  # [FIX 4] campo novo no relatório
         'Traces Stored Size': traces_to_store_size,
+        'Include Label Attributes': args.include_label_attributes,    # [FIX 2] campo novo no relatório
         'LLM ID': model_id,
         'Context Window LLM': args.model_max_length,
         'Max Generated Tokens LLM': max_new_tokens,

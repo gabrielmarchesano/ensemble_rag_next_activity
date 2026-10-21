@@ -95,7 +95,10 @@ def main():
     if args.rebuild_db_and_tests:
         content = lp.read_event_log(args.log)
         traces = lp.extract_traces(content)
-        prefixes = lp.build_prefixes(traces)
+        total_traces_size = len(traces)   # [FIX 9] antes ficava sempre 0 no relatório
+        # [FIX 8] honra os argumentos --prefix_base / --prefix_gap
+        #         Antes: prefixes = lp.build_prefixes(traces)
+        prefixes = lp.build_prefixes(traces, args.prefix_base, args.prefix_gap)
         prefixes, event_attributes, activities_set = lp.process_prefixes(prefixes, args.log)
         traces_to_store_size = len(prefixes)
         vs.store_traces(prefixes, q_client, args.log, embed_model, COLLECTION_NAME)
@@ -109,7 +112,8 @@ def main():
         'Batch Size': args.batch_size,
         'Embedding Model ID': embed_model_id,
         'Vector Space Dimension': space_dimension,
-        'Evaluation Modality': args.evaluation_modality,
+        # [FIX 12] args.evaluation_modality não existe neste parser -> AttributeError ao iniciar o modo live
+        #          Antes: 'Evaluation Modality': args.evaluation_modality,
         'Event Log': args.log,
         'Total Traces in Log': total_traces_size,
         'Traces Stored Size': traces_to_store_size,

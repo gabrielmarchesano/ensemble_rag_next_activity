@@ -76,7 +76,9 @@ class VerificationOracle:
         return bucket_order
 
 
-    def verify_answer(self, prompt, prefix, model_answer):
+    # [FIX 7] Novo parâmetro opcional expected_answer.
+    #         Antes: def verify_answer(self, prompt, prefix, model_answer):
+    def verify_answer(self, prompt, prefix, model_answer, expected_answer=None):
         prefix_length = self._calculate_prefix_length(prefix)
         earlyness_bucket = self._get_earlyness_bucket(prefix_length)
         
@@ -89,11 +91,19 @@ class VerificationOracle:
             'expected_answer': None,
             'verification_result': None
         }
-        expected_answer = self.prefix_with_expected_answer_pairs.get(prefix)
+        # [FIX 7] Usa o rótulo passado pela linha do test set; o dict por prefixo fica só como fallback.
+        #         Antes: expected_answer = self.prefix_with_expected_answer_pairs.get(prefix)
+        if expected_answer is None:
+            expected_answer = self.prefix_with_expected_answer_pairs.get(prefix)
         if expected_answer is not None:
             result["expected_answer"] = expected_answer
 
-            match = re.search(r'\\boxed\{([^}]*)\}', model_answer)
+            # [FIX 10] Pega o ÚLTIMO \boxed{} (resposta final) e aceita um nível de chaves aninhadas
+            #          (\boxed{\text{X}}). Antes pegava o primeiro, que pode ser o modelo repetindo o
+            #          formato pedido (ex.: "\boxed{predicted_activity_name}") no meio do raciocínio.
+            #          Antes: match = re.search(r'\\boxed\{([^}]*)\}', model_answer)
+            boxed =list(re.finditer(r'\\boxed\{((?:[^{}]|\{[^{}]*\})*)\}', model_answer))
+            match = boxed[-1] if boxed else None
             if not match:
                 match = re.search(r'### Assistant:\s*(.*)', model_answer)
             if not match:
@@ -119,8 +129,11 @@ class VerificationOracle:
             else:
                 model_answer = '\\boxed{Wrong format}'
 
+            # [FIX 11] Igualdade exata (normalizada) em vez de substring: com substring, um rótulo que é
+            #          parte de outro nome de classe contaria como acerto.
+            #          Antes: expected_answer.lower().replace(" ", "") in model_answer.lower().replace(" ", "")
             result["verification_result"] = (
-                    expected_answer.lower().replace(" ", "") in model_answer.lower().replace(" ", "")
+                    expected_answer.lower().replace(" ", "") == model_answer.lower().replace(" ", "")
             )
             print(
                 f"Prompt: {prompt}\n"

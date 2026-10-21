@@ -89,35 +89,60 @@ def store_xes_traces(traces, qdrant_client, log_name, embed_model, collection_na
 
 
 def store_traces(traces, qdrant_client, log_name, embed_model, collection_name):
-    points = []
-    identifier = 0
-    stored = []
-
-    for t, prediction in traces.items():
+    # [FIX 3] `traces` agora é a lista de (prefixo, documento) do process_prefixes.
+    #         Antes o dedup era pelo prefixo: com o rótulo fora da chave, isso guardaria só UMA
+    #         continuação por prefixo e apagaria as alternativas que o LLM precisa ver.
+    # [PERF]  Embeddings em lote e upsert em blocos (antes: 1 chamada de embedding por documento).
+    # Antes:
+    #     points = []
+    #     identifier = 0
+    #     stored = []
+    #     for t, prediction in traces.items():
+    #         content = f'[{t}] - {prediction}'
+    #         metadata = {'page_content': content, 'name': f'{log_name} Trace {identifier}'}
+    #         if t not in stored:
+    #             point = models.PointStruct(
+    #                 id=identifier,
+    #                 vector=embed_model.embed_documents([t])[0],
+    #                 payload=metadata
+    #             )
+    #             print(f'Processing point for trace {identifier + 1} of {len(traces)}...')
+    #             points.append(point)
+    #             stored.append(t)
+    #             identifier += 1
+    #     print('Storing points into the vector store...')
+    #     qdrant_client.upsert(collection_name=collection_name, points=points)
+    #     return identifier
+    items = list(traces.items()) if isinstance(traces, dict) else list(traces)   # aceita dict (formato antigo) ou lista
+    seen, keys_to_embed, contents = set(), [], []
+    for t, prediction in items:
         content = f'[{t}] - {prediction}'
-        metadata = {'page_content': content, 'name': f'{log_name} Trace {identifier}'}
-        if t not in stored:
-            point = models.PointStruct(
-                id=identifier,
-                vector=embed_model.embed_documents([t])[0],
-                payload=metadata
-            )
-            print(f'Processing point for trace {identifier + 1} of {len(traces)}...')
-            points.append(point)
-            stored.append(t)
-            identifier += 1
+        if content in seen:
+            continue
+        seen.add(content)
+        keys_to_embed.append(t)   # o embedding continua sendo só da sequência de atividades
+        contents.append(content)
+
+    print(f'Embedding {len(contents)} documents...')
+    vectors = embed_model.embed_documents(keys_to_embed)
+    points = [
+        models.PointStruct(id=i, vector=v, payload={'page_content': c, 'name': f'{log_name} Trace {i}'})
+        for i, (v, c) in enumerate(zip(vectors, contents))
+    ]
 
     print('Storing points into the vector store...')
-    qdrant_client.upsert(
-        collection_name=collection_name,
-        points=points
-    )
+    for start in range(0, len(points), 512):
+        qdrant_client.upsert(collection_name=collection_name, points=points[start:start + 512])
 
-    return identifier
+    return len(points)
 
 
 def retrieve_context(vector_index, query, num_chunks, key=None, search_filter=None):
-    query = query.split('-')[0].strip()
+    # [FIX 6] Isola a sequência de atividades pelo separador real (' - Values:') e tira os colchetes,
+    #         para o embedding da query ter o mesmo formato do embedding dos documentos.
+    #         split('-') cortava no primeiro hífen, inclusive dentro de nomes de atividade (BPIC).
+    #         Antes: query = query.split('-')[0].strip()
+    query = query.split(' - Values:')[0].strip().strip('[]').strip()
     retrieved = vector_index.similarity_search(query, num_chunks)
     if key is not None and search_filter is not None:
         filter_ = models.Filter(
