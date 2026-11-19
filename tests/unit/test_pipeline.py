@@ -63,7 +63,7 @@ def bare(model_id, family=None, use_rag=True):
 
 
 # ==============================================================================================
-# [Raf #6a] Modelo correto
+# Modelo correto
 # ==============================================================================================
 class TestModelResolution:
     @pytest.mark.parametrize('model_id, family, mtype', [
@@ -123,7 +123,7 @@ class TestModelResolution:
 
 
 # ==============================================================================================
-# [Raf #6b] Contexto recuperado e enviado ao modelo
+# Contexto recuperado e enviado ao modelo
 # ==============================================================================================
 class TestProduceAnswer:
     def test_rag_chama_retrieve_com_os_argumentos_certos(self, fake_api, spy_retrieve):

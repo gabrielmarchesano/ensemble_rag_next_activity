@@ -28,7 +28,7 @@ def _all_points(client, collection):
 
 
 # ==============================================================================================
-# [Raf #4] Tudo armazenado no Qdrant
+# Tudo armazenado no Qdrant
 # ==============================================================================================
 class TestStoreTraces:
     def test_todos_os_documentos_sao_armazenados(self, qdrant_mem, fake_embed):
@@ -118,7 +118,7 @@ class TestInitializeVectorStore:
 
 
 # ==============================================================================================
-# [Raf #5] Busca por similaridade
+# Busca por similaridade
 # ==============================================================================================
 @pytest.fixture
 def filled_store(qdrant_mem, fake_embed):

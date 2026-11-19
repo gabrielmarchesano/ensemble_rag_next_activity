@@ -25,7 +25,7 @@ def split_doc(doc):
 
 
 # ==============================================================================================
-# [Raf #1] Extração das traces
+# Extração das traces
 # ==============================================================================================
 class TestExtractTraces:
     def test_mantem_so_traces_com_2_ou_mais_eventos(self, toy_log):
@@ -78,7 +78,7 @@ class TestBuildPrefixes:
 
 
 # ==============================================================================================
-# [Raf #2, reformulado] Rótulo = última atividade do prefixo; input = tudo antes dela
+# Rótulo = última atividade do prefixo; input = tudo antes dela
 # ==============================================================================================
 class TestLabelConstruction:
     def test_rotulo_e_ultima_atividade_e_input_exclui_o_rotulo(self, toy_log):
