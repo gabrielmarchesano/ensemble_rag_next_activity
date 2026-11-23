@@ -41,52 +41,6 @@ def initialize_vector_store(url, grpc_port, collection_name, embed_model, dimens
     return client, store
 
 
-def store_prefixes(prefixes, qdrant_client, log_name, embed_model, collection_name):
-    points = []
-    identifier = 0
-    for p in prefixes:
-        metadata = {'page_content': p, 'name': f'{log_name} Chunk {identifier}'}
-        point = models.PointStruct(
-            id=identifier,
-            vector=embed_model.embed_documents([p])[0],
-            payload=metadata
-        )
-        print(f'Processing point {identifier + 1} of {len(prefixes)}...')
-        points.append(point)
-        identifier += 1
-
-    print('Storing points into the vector store...')
-    qdrant_client.upsert(
-        collection_name=collection_name,
-        points=points
-    )
-
-    return identifier
-
-
-def store_xes_traces(traces, qdrant_client, log_name, embed_model, collection_name):
-    points = []
-    identifier = 0
-    for t in traces:
-        t = ''.join(t)
-        metadata = {'page_content': t, 'name': f'{log_name} Trace {identifier}'}
-        point = models.PointStruct(
-            id=identifier,
-            vector=embed_model.embed_documents([t])[0],
-            payload=metadata
-        )
-        print(f'Processing point for trace {identifier + 1} of {len(traces)}...')
-        points.append(point)
-        identifier += 1
-
-    print('Storing points into the vector store...')
-    qdrant_client.upsert(
-        collection_name=collection_name,
-        points=points
-    )
-
-    return identifier
-
 
 def store_traces(traces, qdrant_client, log_name, embed_model, collection_name):
     # [FIX 3] `traces` agora é a lista de (prefixo, documento) do process_prefixes.
