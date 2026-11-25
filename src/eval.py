@@ -101,13 +101,12 @@ def parse_arguments():
     parser.add_argument('--prefix_gap', type=int, help='Gap number of events in a prefix trace',
                         default=3)
     # [FIX 4] Argumentos novos (antes 0.3 e 300 eram fixos no código: generate_test_set(traces, 0.3) e size=300).
-    # [FIX 2] --include_label_attributes True volta ao comportamento antigo dos atributos.
+
     parser.add_argument('--test_proportion', type=float, default=0.3,
                         help='Proportion of TRACES held out for testing (paper §5.2: 70/30)')
     parser.add_argument('--test_size', type=int, default=300,
                         help='Number of test prefixes sampled from the held-out traces')
-    parser.add_argument('--include_label_attributes', type=u.str2bool, default=False,
-                        help='Old behaviour: include the attributes of the label event in Values (leaks the label)')
+
     parser.add_argument('--max_new_tokens', type=int, help='Maximum number of tokens to generate',
                         default=2048)
     parser.add_argument('--batch_size', type=int, default=32)
@@ -165,14 +164,12 @@ def main():
     total_traces_size = len(traces)
     kb_traces, test_traces = lp.split_traces(traces, args.test_proportion)
     kb_prefixes = lp.build_prefixes(kb_traces, args.prefix_base, args.prefix_gap)
-    kb_docs, event_attributes, activities_set = lp.process_prefixes(kb_prefixes, args.log,
-                                                                    args.include_label_attributes)
+    kb_docs, event_attributes, activities_set = lp.process_prefixes(kb_prefixes, args.log)
     if args.rebuild_db_and_tests:
         traces_to_store_size = vs.store_traces(kb_docs, q_client, args.log, embed_model, COLLECTION_NAME)
         test_attrs, test_acts = lp.generate_csv_from_test_set(test_traces, test_set_path, size=args.test_size,
                                                               log_name=args.log, base=args.prefix_base,
-                                                              gap=args.prefix_gap,
-                                                              include_label_attributes=args.include_label_attributes)
+                                                              gap=args.prefix_gap)
         event_attributes = {**test_attrs, **event_attributes}
         activities_set = activities_set | test_acts   # espaço de classes = todas as atividades do log
     test_set_size = len(test_traces)

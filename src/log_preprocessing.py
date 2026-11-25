@@ -40,15 +40,14 @@ def build_prefixes(traces, base=1, gap=3):
     return prefixes
 
 
-# [FIX 2] Novo parâmetro include_label_attributes.
-#         Antes: def process_prefixes(traces, log_name=None):
-def process_prefixes(traces, log_name=None, include_label_attributes=False):
+def process_prefixes(traces, log_name=None):
     # Resumo das correções nesta função:
     # [FIX 1] Cada prefixo <a1,...,an> vira o documento "[a1,...,a(n-1)] - Values: {...} | Next activity: an".
     #         Antes a chave era <a1,...,an> inteira e o rótulo era an: o input já continha a resposta.
-    # [FIX 2] Por padrão os atributos vêm só dos eventos ANTERIORES ao evento-rótulo. O org:group do
-    #         evento-rótulo, sozinho, acerta 61% do test set do sepsis (ex.: grupo E -> Release A).
-    #         include_label_attributes=True reproduz o comportamento antigo (leitura literal do §4.1 do paper).
+    # [FIX 2] Values = estado dos atributos ao fim do prefixo: eventos até a ÚLTIMA atividade do prefixo
+    #         (a penúltima da sequência completa), inclusive. Cada chave guarda o último valor visto até ali.
+    #         O evento-rótulo fica de fora: o org:group dele, sozinho, acertava 61% do test set do sepsis
+    #         (ex.: grupo E -> Release A). Fatiamento igual ao do autor (commit 7ebd63f).
     # [FIX 3] Retorna uma LISTA de (prefixo, documento), com dedup por transição (prefixo, próxima atividade).
     #         Um dict indexado pelo prefixo descartaria continuações alternativas do mesmo prefixo.
     concept_name_pattern = re.compile(r'<string key="concept:name" value="(.*?)"\s*/>', re.DOTALL)
@@ -135,10 +134,11 @@ def process_prefixes(traces, log_name=None, include_label_attributes=False):
         seen_prefixes.add(transition)
         #Se esta transição (prefixo -> próxima atividade) já tiver sido processada, ignora-a.
         attr_vals = {}
-        # [FIX 2] Atributos só dos eventos ANTES do evento-rótulo (padrão) ou de todos (modo antigo).
+        # [FIX 2] Atributos só até a última atividade do prefixo, inclusive (= events[:cl_event_idx[-2] + 1]
+        #         no código do autor). Exclui o evento-rótulo e também eventos não-"complete" entre a última
+        #         atividade do prefixo e o rótulo (ex.: o "start" da atividade-rótulo).
         #         Antes: for evt in events:     (incluía o evento-rótulo; o último valor sobrescreve os outros)
-        attr_events = events if include_label_attributes else events[:kept_idx[-1]]
-        for evt in attr_events:
+        for evt in events[:kept_idx[-2] + 1]:
             for attribute_match in attribute_pattern.findall(evt):       
                 key, value = attribute_match    #Percorre todos os eventos do trace e encontra todos os pares key / value presentes.
                 if key != "lifecycle:transition" and key != "concept:name":
@@ -181,14 +181,11 @@ def split_traces(traces, test_set_proportion):
 
 
 # [FIX 8] Recebe base/gap (antes build_prefixes rodava sempre com o default gap=3).
-# [FIX 2] Recebe include_label_attributes e repassa ao process_prefixes.
 #         Antes: def generate_csv_from_test_set(test_set, test_path, size=300, log_name=None):
-def generate_csv_from_test_set(test_set, test_path, size=300, log_name=None, base=1, gap=3,
-                               include_label_attributes=False):
+def generate_csv_from_test_set(test_set, test_path, size=300, log_name=None, base=1, gap=3):
     # [FIX 8] Antes: test_set = build_prefixes(test_set)
     test_set = build_prefixes(test_set, base, gap)
-    # [FIX 2] Antes: test_set, attr_keys, act_list = process_prefixes(test_set, log_name)
-    test_set, attr_keys, act_list = process_prefixes(test_set, log_name, include_label_attributes)
+    test_set, attr_keys, act_list = process_prefixes(test_set, log_name)
     if size > len(test_set):
         size = len(test_set)
     # [FIX 3] process_prefixes agora devolve lista de pares, não dict.
