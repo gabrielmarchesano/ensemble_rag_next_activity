@@ -35,6 +35,25 @@ python3 src/eval.py $COMMON --rebuild_db_and_tests False --strategy ensemble --e
 python3 src/eval.py $COMMON --rebuild_db_and_tests False --strategy ensemble --ensemble_mode partition \
     --ensemble_llms openai/gpt-oss-120b,openai/gpt-oss-20b,qwen/qwen3.8-27b $GROQ
 
+# 4) [BAGGING] Bootstrap do contexto: busca o MESMO pool de 9 do partition e sorteia, para cada LLM,
+#    3 docs COM reposição (sorteio fixo por prefixo, --bag_seed). Partition x bagging = mesmo pool,
+#    mesmos modelos; só muda "fatia fixa" x "sorteio".
+python3 src/eval.py $COMMON --rebuild_db_and_tests False --strategy ensemble --ensemble_mode bagging \
+    --ensemble_llms openai/gpt-oss-120b,openai/gpt-oss-20b,qwen/qwen3.8-27b $GROQ
+
+# 4b) Teto do pool sem LLM (sem cota): label_in_context_rate do kNN com k = tamanho do pool
+python3 src/eval.py $COMMON --rebuild_db_and_tests False --strategy knn --knn_k 9
+
+# 4c) Ablações (uma de cada vez, depois da 4):
+#   pool maior:        --bag_pool_size 20
+#   sem reposição:     --bag_replacement False          (pasting)
+#   outra semente:     --bag_seed 11                    (variância do sorteio; rodar 2-3 seeds)
+
+# 5) [BAGGING] Homogêneo (bagging "clássico": mesmo modelo, diversidade só das bags) -> Kaggle.
+#    Na Groq o mesmo id 5x divide UMA cota (5x mais lento). Ex.:
+#   python3 src/eval.py $COMMON --rebuild_db_and_tests False --strategy ensemble --ensemble_mode bagging \
+#       --ensemble_llms Qwen/Qwen2.5-7B-Instruct,Qwen/Qwen2.5-7B-Instruct,Qwen/Qwen2.5-7B-Instruct,Qwen/Qwen2.5-7B-Instruct,Qwen/Qwen2.5-7B-Instruct
+
 # Kaggle (GPU T4 x2, modelos locais em 4-bit): sem os parâmetros $GROQ, ex.:
 #   python3 src/eval.py $COMMON --rebuild_db_and_tests False --strategy ensemble --ensemble_mode shared \
 #       --ensemble_llms Qwen/Qwen2.5-7B-Instruct,microsoft/phi-4,meta-llama/Llama-3.1-8B-Instruct

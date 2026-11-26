@@ -199,9 +199,17 @@ def parse_arguments():
     parser.add_argument('--ensemble_llms', type=str, default=None,
                         help='[ensemble] LLMs separados por vírgula, ex.: "gpt-4.1,gpt-4o-mini,gemini-2.5-flash". '
                              'Repetir um id usa o mesmo modelo com contextos diferentes (modo partition)')
-    parser.add_argument('--ensemble_mode', type=str, default='partition', choices=['shared', 'partition'],
+    parser.add_argument('--ensemble_mode', type=str, default='partition', choices=['shared', 'partition', 'bagging'],
                         help='[ensemble] shared: todos veem os mesmos top-k; partition: busca k*n e distribui '
-                             'em rodízio (k = --num_documents_in_context por LLM)')
+                             'em rodízio; bagging: busca um pool top-K e sorteia k docs com reposição para '
+                             'cada LLM (k = --num_documents_in_context por LLM)')
+    # [BAGGING]
+    parser.add_argument('--bag_pool_size', type=int, default=None,
+                        help='[bagging] Tamanho K do pool recuperado. Default: k * n (o mesmo do partition)')
+    parser.add_argument('--bag_replacement', type=u.str2bool, default=True,
+                        help='[bagging] True = bootstrap (com reposição); False = sem reposição (pasting)')
+    parser.add_argument('--bag_seed', type=int, default=SEED,
+                        help='[bagging] Semente do sorteio das bags (independente da seed do split)')
     # [GROQ] Controle de cota da API e retomada
     parser.add_argument('--requests_per_minute', type=float, default=None,
                         help='[api] Throttle por modelo. Groq grátis: ~6 com k=3 (8K tokens/min ÷ ~1,3K por chamada)')
@@ -216,6 +224,8 @@ def parse_arguments():
         parser.error('--strategy ensemble exige --ensemble_llms')
     if args.strategy == 'ensemble' and not args.rag:
         parser.error('--strategy ensemble exige --rag True')
+    if args.ensemble_mode != 'bagging' and (args.bag_pool_size is not None or not args.bag_replacement):
+        parser.error('--bag_pool_size/--bag_replacement só valem com --ensemble_mode bagging')
     return args
 
 
@@ -230,6 +240,13 @@ def checkpoint_path_for(args, test_set_path):
     cfg = {k: getattr(args, k, None) for k in CHECKPOINT_KEYS}
     if cfg['strategy'] != 'single':
         cfg['llm_id'] = None   # o --llm_id só é usado pela estratégia single
+    # [BAGGING] Parâmetros do sorteio entram na chave SÓ no modo bagging: assim os checkpoints de
+    #           shared/partition já em andamento continuam com a mesma chave e retomam normalmente.
+    if cfg['strategy'] == 'ensemble' and cfg['ensemble_mode'] == 'bagging':
+        n = len([m for m in args.ensemble_llms.split(',') if m.strip()])
+        cfg['bag_pool_size'] = args.bag_pool_size if args.bag_pool_size is not None else args.num_documents_in_context * n
+        cfg['bag_replacement'] = args.bag_replacement
+        cfg['bag_seed'] = args.bag_seed
     with open(test_set_path, 'rb') as f:
         cfg['test_set_md5'] = hashlib.md5(f.read()).hexdigest()
     key = hashlib.md5(json.dumps(cfg, sort_keys=True).encode()).hexdigest()[:10]
@@ -254,10 +271,17 @@ def build_predictor(args, q_store, num_docs, max_new_tokens):
             if model_id not in cache:
                 cache[model_id] = p.RAGPipeline(model_id, max_new_tokens, True, **api_kwargs)
         predictor = ens.LLMEnsemble([(m, cache[m]) for m in ids], q_store, docs_per_llm=num_docs,
-                                    mode=args.ensemble_mode)
-        return predictor, {'LLM ID': ids, 'Ensemble Mode': args.ensemble_mode,
-                           'Ensemble Aggregation': 'majority vote (tie: member order)',
-                           'Documents Retrieved per Prefix': num_docs * (len(ids) if args.ensemble_mode == 'partition' else 1)}
+                                    mode=args.ensemble_mode, pool_size=args.bag_pool_size,
+                                    bag_replacement=args.bag_replacement, bag_seed=args.bag_seed)
+        info = {'LLM ID': ids, 'Ensemble Mode': args.ensemble_mode,
+                'Ensemble Aggregation': 'majority vote (tie: member order)',
+                'Documents Retrieved per Prefix': predictor.retrieved_per_prefix()}
+        if args.ensemble_mode == 'bagging':   # [BAGGING]
+            info.update({'Bagging Pool Size': predictor.pool_size,
+                         'Bagging Sampling': 'with replacement (bootstrap)' if args.bag_replacement
+                                             else 'without replacement (pasting)',
+                         'Bagging Seed': args.bag_seed})
+        return predictor, info
     pipeline_instance = p.RAGPipeline(args.llm_id, max_new_tokens, args.rag, **api_kwargs)
     return ens.SinglePredictor(pipeline_instance, q_store, num_docs), {'LLM ID': args.llm_id}
 
