@@ -7,6 +7,45 @@ from collections import defaultdict
 from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score
 
 
+WRONG_FORMAT = '\\boxed{Wrong format}'
+
+
+# [ENSEMBLE] Parsing extraído de verify_answer (mesma lógica, linha a linha) para ser reutilizado:
+#            cada LLM do ensemble é parseado assim ANTES do voto. Devolve o nome de uma classe de
+#            total_classes ou WRONG_FORMAT.
+def parse_model_answer(model_answer, total_classes):
+    # [FIX 10] Pega o ÚLTIMO \boxed{} (resposta final) e aceita um nível de chaves aninhadas
+    #          (\boxed{\text{X}}). Antes pegava o primeiro, que pode ser o modelo repetindo o
+    #          formato pedido (ex.: "\boxed{predicted_activity_name}") no meio do raciocínio.
+    #          Antes: match = re.search(r'\\boxed\{([^}]*)\}', model_answer)
+    boxed = list(re.finditer(r'\\boxed\{((?:[^{}]|\{[^{}]*\})*)\}', model_answer))
+    match = boxed[-1] if boxed else None
+    if not match:
+        match = re.search(r'### Assistant:\s*(.*)', model_answer)
+    if not match:
+        matches = list(re.finditer(r'\| Next activity:\s*(.*)', model_answer))
+        if matches:
+            match = matches[-1]  # Last one
+    if not match:
+        return WRONG_FORMAT
+    content = match.group(1).strip("'")
+    if "None" in content:
+        return WRONG_FORMAT
+    # Remove \text{} and special characters
+    content = re.sub(r'\\text\{(.*?)\}', r'\1', content)
+    content = re.sub(r'[^a-zA-Z0-9\s]', '', content).strip()
+    # Find closest class match
+    closest_match = difflib.get_close_matches(content, total_classes, n=1, cutoff=0.6)
+    return closest_match[0] if closest_match else WRONG_FORMAT
+
+
+# [FIX 11] Igualdade exata (normalizada) em vez de substring: com substring, um rótulo que é
+#          parte de outro nome de classe contaria como acerto.
+#          Antes: expected_answer.lower().replace(" ", "") in model_answer.lower().replace(" ", "")
+def is_correct(predicted, expected):
+    return expected.lower().replace(" ", "") == predicted.lower().replace(" ", "")
+
+
 class VerificationOracle:
     def __init__(self, info_run, earlyness_boundaries=None):
         self.true_next_activities = []
@@ -78,7 +117,11 @@ class VerificationOracle:
 
     # [FIX 7] Novo parâmetro opcional expected_answer.
     #         Antes: def verify_answer(self, prompt, prefix, model_answer):
-    def verify_answer(self, prompt, prefix, model_answer, expected_answer=None):
+    # [ENSEMBLE] already_parsed=True: model_answer já é uma classe (ou WRONG_FORMAT), vinda do voto do
+    #            kNN ou do ensemble, e não passa de novo pelo parsing. details: dict extra gravado no
+    #            relatório (respostas individuais, votos, rótulos recuperados).
+    def verify_answer(self, prompt, prefix, model_answer, expected_answer=None, already_parsed=False,
+                      details=None):
         prefix_length = self._calculate_prefix_length(prefix)
         earlyness_bucket = self._get_earlyness_bucket(prefix_length)
         
@@ -91,6 +134,8 @@ class VerificationOracle:
             'expected_answer': None,
             'verification_result': None
         }
+        if details is not None:
+            result['details'] = details
         # [FIX 7] Usa o rótulo passado pela linha do test set; o dict por prefixo fica só como fallback.
         #         Antes: expected_answer = self.prefix_with_expected_answer_pairs.get(prefix)
         if expected_answer is None:
@@ -98,43 +143,10 @@ class VerificationOracle:
         if expected_answer is not None:
             result["expected_answer"] = expected_answer
 
-            # [FIX 10] Pega o ÚLTIMO \boxed{} (resposta final) e aceita um nível de chaves aninhadas
-            #          (\boxed{\text{X}}). Antes pegava o primeiro, que pode ser o modelo repetindo o
-            #          formato pedido (ex.: "\boxed{predicted_activity_name}") no meio do raciocínio.
-            #          Antes: match = re.search(r'\\boxed\{([^}]*)\}', model_answer)
-            boxed =list(re.finditer(r'\\boxed\{((?:[^{}]|\{[^{}]*\})*)\}', model_answer))
-            match = boxed[-1] if boxed else None
-            if not match:
-                match = re.search(r'### Assistant:\s*(.*)', model_answer)
-            if not match:
-                matches = list(re.finditer(r'\| Next activity:\s*(.*)', model_answer))
-                if matches:
-                    match = matches[-1]  # Last one
-            if match:
-                content = match.group(1).strip("'")
-
-                if "None" in content:
-                    model_answer = '\\boxed{Wrong format}'
-                else:
-                    # Remove \text{} and special characters
-                    content = re.sub(r'\\text\{(.*?)\}', r'\1', content)
-                    content = re.sub(r'[^a-zA-Z0-9\s]', '', content).strip()
-
-                    # Find closest class match
-                    closest_match = difflib.get_close_matches(content, self.total_classes, n=1, cutoff=0.6)
-                    if closest_match:
-                        model_answer = closest_match[0]
-                    else:
-                        model_answer = '\\boxed{Wrong format}'
-            else:
-                model_answer = '\\boxed{Wrong format}'
-
-            # [FIX 11] Igualdade exata (normalizada) em vez de substring: com substring, um rótulo que é
-            #          parte de outro nome de classe contaria como acerto.
-            #          Antes: expected_answer.lower().replace(" ", "") in model_answer.lower().replace(" ", "")
-            result["verification_result"] = (
-                    expected_answer.lower().replace(" ", "") == model_answer.lower().replace(" ", "")
-            )
+            # [ENSEMBLE] Parsing (FIX 10) movido para parse_model_answer; comparação (FIX 11) para is_correct.
+            if not already_parsed:
+                model_answer = parse_model_answer(model_answer, self.total_classes)
+            result["verification_result"] = is_correct(model_answer, expected_answer)
             print(
                 f"Prompt: {prompt}\n"
                 f"Answer: {model_answer}\n"
@@ -259,6 +271,8 @@ class VerificationOracle:
                 file.write(f"Model Answer: {result['model_answer']}\n")
                 file.write(f"Expected Answer: {result['expected_answer']}\n")
                 file.write(f"Verification Result: {result['verification_result']}\n")
+                if 'details' in result:   # [ENSEMBLE] respostas individuais / votos / rótulos recuperados
+                    file.write(f"Details: {result['details']}\n")
                 file.write("\n#####################################################################################\n")
 
     def get_earlyness_summary(self):
