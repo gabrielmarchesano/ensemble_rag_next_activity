@@ -6,10 +6,25 @@ from langchain.chat_models import init_chat_model
 from langchain_huggingface import HuggingFacePipeline, HuggingFaceEmbeddings
 from langchain_core.prompts import PromptTemplate
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline, BitsAndBytesConfig, AutoConfig
-from torch import bfloat16
+import torch
+from torch import bfloat16, float16
 from sentence_transformers import SentenceTransformer
 
+from errors import QuotaExhausted
 from vector_store import retrieve_context
+
+
+def _compute_dtype():
+    # [KAGGLE] A T4 do Kaggle (GPU T4 x2) não tem bfloat16 nativo: usa float16 nela; bfloat16 em GPUs
+    #          que suportam (A100, L4, H100...). Antes: bnb_4bit_compute_dtype=bfloat16 fixo.
+    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        return bfloat16
+    return float16
+
+
+def _is_rate_limit(error) -> bool:
+    # [GROQ] groq.RateLimitError / openai.RateLimitError (HTTP 429), sem importar os SDKs aqui
+    return type(error).__name__ == 'RateLimitError' or getattr(error, 'status_code', None) == 429
 
 
 class RAGPipeline:
@@ -19,6 +34,12 @@ class RAGPipeline:
             'google_genai': ['gemini-2.0-flash', 'gemini-2.5-flash-preview-05-20', 'gemini-2.5-pro', 'gemini-2.5-flash'],
             'deepseek': ['deepseek-chat', 'deepseek-reasoner'],
             'anthropic': [],
+            # [GROQ] ids exatos da Groq (console.groq.com/docs/models, lido em 25/11/2026). Os limites do
+            #        plano gratuito valem POR MODELO: gpt-oss-120b, gpt-oss-20b e qwen3.8-27b -> 30 RPM,
+            #        1K RPD, 8K TPM, 200K TPD. Os llama aparecem como "Enterprise pricing": confira em
+            #        console.groq.com/settings/limits se estão liberados na sua conta.
+            'groq': ['openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'qwen/qwen3.8-27b',
+                     'llama-3.3-70b-versatile', 'llama-3.1-8b-instant'],
         },
         'local': {
             'metaai': ['meta-llama/Meta-Llama-3-8B-Instruct', 'meta-llama/Llama-3.1-8B-Instruct',
@@ -49,7 +70,8 @@ class RAGPipeline:
         'deepseek': 'template-deepseek',
         'openai': 'template-generic',
         'google_genai': 'template-generic',
-        'anthropic': 'template-generic'
+        'anthropic': 'template-generic',
+        'groq': 'template-generic'      # [GROQ]
     }
     RESPONSE_DELIMITERS = {
         'metaai': '<|start_header_id|>assistant<|end_header_id|>',
@@ -60,13 +82,23 @@ class RAGPipeline:
         'deepseek': 'Assistant: '
     }
 
-    def __init__(self, model_id: str, max_new_tokens: int, use_rag: bool = True) -> None:
+    # [GROQ] Parâmetros novos, todos opcionais (os outros provedores ignoram):
+    #   requests_per_minute: throttle do lado do cliente (o limite que costuma estourar primeiro é o de
+    #                        8K tokens/min; com ~1,3K tokens por chamada, ~6 RPM evita a maioria dos 429)
+    #   max_retries:         retentativas do SDK em 429/timeout (ele respeita o retry-after)
+    #   reasoning_effort:    gpt-oss: 'low' | 'medium' | 'high'. Menos raciocínio = menos tokens do teto diário
+    def __init__(self, model_id: str, max_new_tokens: int, use_rag: bool = True,
+                 requests_per_minute: float = None, max_retries: int = 8, reasoning_effort: str = None) -> None:
         self.model_id = model_id
         self.model_family, self.model_type = self._get_model_family_type()
         if not self.model_family:
             raise ValueError(f"Could not determine model family for ID: {self.model_id}. Please check MODELS definition.")
         self.max_new_tokens = max_new_tokens
         self.use_rag = use_rag
+        self.requests_per_minute = requests_per_minute
+        self.max_retries = max_retries
+        self.reasoning_effort = reasoning_effort
+        self.usage = {'calls': 0, 'input_tokens': 0, 'output_tokens': 0}   # [GROQ] para planejar o teto diário
         self.llm = self._initialize_model()
         self.prompt_template = self._generate_prompt_template()
         self.chain = self.prompt_template | self.llm
@@ -88,7 +120,7 @@ class RAGPipeline:
                 load_in_4bit=True,
                 bnb_4bit_quant_type='nf4',
                 bnb_4bit_use_double_quant=True,
-                bnb_4bit_compute_dtype=bfloat16
+                bnb_4bit_compute_dtype=_compute_dtype()   # [KAGGLE] Antes: bfloat16 (sem suporte nativo na T4)
             )
             model_config = AutoConfig.from_pretrained(self.model_id, token=HF_AUTH)
             model = AutoModelForCausalLM.from_pretrained(
@@ -126,6 +158,28 @@ class RAGPipeline:
             return HuggingFacePipeline(pipeline=generate_text) 
             
         elif self.model_type == 'api':
+            if self.model_family == 'groq':
+                # [GROQ] precisa de `pip install langchain-groq` e da variável GROQ_API_KEY
+                extra = {'max_retries': self.max_retries}
+                if self.requests_per_minute:
+                    from langchain_core.rate_limiters import InMemoryRateLimiter
+                    extra['rate_limiter'] = InMemoryRateLimiter(
+                        requests_per_second=self.requests_per_minute / 60, check_every_n_seconds=0.5)
+                if self.reasoning_effort:
+                    # Só gpt-oss (low|medium|high) e qwen3.8 (none|default|low|medium|high) aceitam o campo
+                    # (console.groq.com/docs/reasoning, 25/11/2026); nos outros ele é ignorado, para um
+                    # ensemble misto não quebrar com 400.
+                    if any(tag in self.model_id.lower() for tag in ('gpt-oss', 'qwen3')):
+                        extra['reasoning_effort'] = self.reasoning_effort
+                    else:
+                        print(f"Warning: reasoning_effort ignorado para {self.model_id} (modelo sem esse parâmetro).")
+                return init_chat_model(
+                    self.model_id,
+                    model_provider='groq',
+                    temperature=0.1,
+                    max_tokens=self.max_new_tokens,
+                    **extra
+                )
             return init_chat_model(
                 self.model_id,
                 model_provider=self.model_family,
@@ -177,24 +231,14 @@ class RAGPipeline:
         
         if self.use_rag:
             context = retrieve_context(vectdb, question, num_chunks)
-            payload = {
-                "question": question,
-                "system_message": sys_mess,
-                "context": context
-            }
-            result = self.chain.invoke(payload)
-            
-            if self.model_type == 'local':
-                prompt, answer = self._parse_llm_answer(result)
-            else:
-                prompt = f'{sys_mess}\nHere is the most similar past traces: {context}\n' + f'Here is the prefix to predict: {question}\nAnswer: '
-                answer = result.content if hasattr(result, 'content') else str(result)
+            # [ENSEMBLE] Geração movida para produce_answer_with_context (comportamento igual).
+            return self.produce_answer_with_context(question, context, info_run)
         else:
             payload = {
                 "question": question,
                 "system_message": sys_mess
             }
-            result = self.chain.invoke(payload)            
+            result = self._invoke(payload)   # [GROQ] Antes: self.chain.invoke(payload)
             if self.model_type == 'local':
                 prompt, answer = self._parse_llm_answer(result)
             else:
@@ -202,6 +246,43 @@ class RAGPipeline:
                 answer = result.content if hasattr(result, 'content') else str(result)
 
         return prompt, answer
+
+    # [ENSEMBLE] Gera a resposta com um contexto JÁ MONTADO (texto no formato do retrieve_context).
+    #            Permite ao ensemble buscar uma vez e decidir quais documentos cada LLM recebe.
+    def produce_answer_with_context(self, question: str, context: str, info_run: Dict) -> Tuple[str, str]:
+        if not self.use_rag:
+            raise ValueError("produce_answer_with_context exige use_rag=True (o template precisa de {context}).")
+        sys_mess = self._get_system_message(info_run)
+        payload = {
+            "question": question,
+            "system_message": sys_mess,
+            "context": context
+        }
+        result = self._invoke(payload)   # [GROQ] Antes: self.chain.invoke(payload)
+
+        if self.model_type == 'local':
+            prompt, answer = self._parse_llm_answer(result)
+        else:
+            prompt = f'{sys_mess}\nHere is the most similar past traces: {context}\n' + f'Here is the prefix to predict: {question}\nAnswer: '
+            answer = result.content if hasattr(result, 'content') else str(result)
+        return prompt, answer
+
+    # [GROQ] Ponto único de chamada ao modelo: soma os tokens (usage_metadata) e transforma o 429 que
+    #        sobrou depois das retentativas em QuotaExhausted, para a run parar e ser retomada depois.
+    def _invoke(self, payload: Dict):
+        try:
+            result = self.chain.invoke(payload)
+        except Exception as e:
+            if _is_rate_limit(e):
+                raise QuotaExhausted(f'{self.model_id}: limite da API atingido ({e}). '
+                                     f'Rode de novo depois que o limite resetar; o checkpoint retoma daqui.') from e
+            raise
+        usage = self.__dict__.setdefault('usage', {'calls': 0, 'input_tokens': 0, 'output_tokens': 0})
+        usage['calls'] += 1
+        meta = getattr(result, 'usage_metadata', None) or {}
+        usage['input_tokens'] += meta.get('input_tokens', 0) or 0
+        usage['output_tokens'] += meta.get('output_tokens', 0) or 0
+        return result
 
     def _parse_llm_answer(self, complete_answer: str) -> Tuple[str, str]:
         model_family_key = self.model_family.lower()
@@ -304,4 +385,3 @@ def initialize_embedding_model(model_id: str, device: str = 'cpu', batch_size: i
     except Exception as e:
         print(f"Error initializing embedding model: {str(e)}")
         raise
-

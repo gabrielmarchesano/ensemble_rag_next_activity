@@ -4,7 +4,13 @@ from langchain_qdrant import QdrantVectorStore
 
 
 def initialize_vector_store(url, grpc_port, collection_name, embed_model, dimension, rebuild_db):
-    client = QdrantClient(url, grpc_port=grpc_port, prefer_grpc=True)
+    # [KAGGLE] Sem servidor Qdrant (Kaggle, PC sem Docker): QDRANT_URL=path:/caminho/da/pasta grava a KB
+    #          em disco e sobrevive entre runs (permite --rebuild_db_and_tests False). ':memory:' também
+    #          funciona, mas some ao fim do processo. Qualquer outro valor = servidor, como antes.
+    if url and url.startswith('path:'):
+        client = QdrantClient(path=url[len('path:'):])
+    else:
+        client = QdrantClient(url, grpc_port=grpc_port, prefer_grpc=True)
     if rebuild_db:
         try:
             client.delete_collection(collection_name)
@@ -91,12 +97,41 @@ def store_traces(traces, qdrant_client, log_name, embed_model, collection_name):
     return len(points)
 
 
-def retrieve_context(vector_index, query, num_chunks, key=None, search_filter=None):
+def clean_query(query):
     # [FIX 6] Isola a sequência de atividades pelo separador real (' - Values:') e tira os colchetes,
     #         para o embedding da query ter o mesmo formato do embedding dos documentos.
     #         split('-') cortava no primeiro hífen, inclusive dentro de nomes de atividade (BPIC).
     #         Antes: query = query.split('-')[0].strip()
-    query = query.split(' - Values:')[0].strip().strip('[]').strip()
+    return query.split(' - Values:')[0].strip().strip('[]').strip()
+
+
+def label_from_document(page_content):
+    # [ENSEMBLE] Documento da KB: "[a1,...,an-1] - Values: {...} | Next activity: an" -> "an"
+    if '| Next activity:' not in page_content:
+        return None
+    return page_content.rsplit('| Next activity:', 1)[1].strip()
+
+
+def retrieve_documents(vector_index, query, num_chunks):
+    # [ENSEMBLE] Mesma busca do retrieve_context, mas devolve os documentos estruturados (com score e
+    #            rótulo) em vez de texto: base do kNN, do recall@k e da partição de contexto do ensemble.
+    #            A ordem é a mesma do similarity_search (rank 1 = mais similar).
+    hits = vector_index.similarity_search_with_score(clean_query(query), k=num_chunks)
+    return [{'rank': i + 1,
+             'content': doc.page_content,
+             'label': label_from_document(doc.page_content),
+             'score': float(score)}
+            for i, (doc, score) in enumerate(hits)]
+
+
+def format_context(documents):
+    # [ENSEMBLE] Mesmo formato de texto que o retrieve_context monta ("\n1. doc\n2. doc ..."), para o
+    #            prompt de cada LLM do ensemble ser idêntico ao do controle quando o contexto é o mesmo.
+    return ''.join(f'\n{i + 1}. {d["content"]}' for i, d in enumerate(documents))
+
+
+def retrieve_context(vector_index, query, num_chunks, key=None, search_filter=None):
+    query = clean_query(query)   # [ENSEMBLE] lógica do FIX 6 movida para clean_query (comportamento igual)
     retrieved = vector_index.similarity_search(query, num_chunks)
     if key is not None and search_filter is not None:
         filter_ = models.Filter(
